@@ -1,0 +1,638 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © Chan Theory Data Engine — MCP Compatible Output
+// Version: 1.0.0
+
+//@version=5
+indicator("缠论数据引擎 [MCP适配]", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=100)
+
+// ============================================================
+// SECTION 0 — USER INPUTS
+// ============================================================
+lookback     = input.int(300,  "回溯K线数",        minval=50,  maxval=500)
+macd_fast    = input.int(12,   "MACD快线",         minval=2,   maxval=50)
+macd_slow    = input.int(26,   "MACD慢线",         minval=2,   maxval=100)
+macd_signal  = input.int(9,    "MACD信号线",       minval=2,   maxval=50)
+show_bi      = input.bool(true,"显示笔线")
+show_zs      = input.bool(true,"显示中枢")
+show_label   = input.bool(true,"显示买卖点标签")
+
+// ============================================================
+// SECTION 1 — MACD HISTOGRAM (for divergence area)
+// ============================================================
+[macd_line, signal_line, hist] = ta.macd(close, macd_fast, macd_slow, macd_signal)
+
+// ============================================================
+// SECTION 2 — K-LINE CONTAINMENT PROCESSING (包含处理)
+// Only process the most recent `lookback` bars for performance.
+//
+// We build four arrays representing the "processed" (合并后) K线:
+//   proc_high  — processed high
+//   proc_low   — processed low
+//   proc_idx   — bar_index of representative bar
+//   proc_dir   — containment direction (1=up, -1=down, 0=undefined)
+// ============================================================
+
+// Arrays stored as persistent vars, rebuilt each bar is too expensive.
+// We use a ring-buffer approach: only recalculate from scratch when
+// bar_index == last_bar_index (final bar), so the heavy logic runs once.
+
+var float[] proc_high = array.new_float(0)
+var float[] proc_low  = array.new_float(0)
+var int[]   proc_idx  = array.new_int(0)
+var int[]   proc_bar  = array.new_int(0)   // original bar_index for labels
+
+// Helper: safe array.get with bounds check
+f_get_f(arr, i) =>
+    s = array.size(arr)
+    (s > 0 and i >= 0 and i < s) ? array.get(arr, i) : float(na)
+
+f_get_i(arr, i) =>
+    s = array.size(arr)
+    (s > 0 and i >= 0 and i < s) ? array.get(arr, i) : int(na)
+
+// ---- Build processed K-lines on the last confirmed bar ----
+if barstate.islast
+    array.clear(proc_high)
+    array.clear(proc_low)
+    array.clear(proc_idx)
+    array.clear(proc_bar)
+
+    // Collect raw bars from lookback window
+    raw_n = math.min(lookback, bar_index + 1)
+
+    // Local temp arrays
+    float[] rh = array.new_float(raw_n)
+    float[] rl = array.new_float(raw_n)
+    int[]   ri = array.new_int(raw_n)
+
+    for j = 0 to raw_n - 1
+        offset = raw_n - 1 - j
+        array.set(rh, j, high[offset])
+        array.set(rl, j, low[offset])
+        array.set(ri, j, bar_index - offset)
+
+    // Apply containment merging
+    // Direction: compare the LAST two merged candles
+    //   if prev_merged > prev_prev_merged → uptrend → keep high high, low high
+    //   if prev_merged < prev_prev_merged → downtrend → keep high low, low low
+    for j = 0 to raw_n - 1
+        cur_h = array.get(rh, j)
+        cur_l = array.get(rl, j)
+        cur_i = array.get(ri, j)
+
+        psize = array.size(proc_high)
+
+        if psize == 0
+            array.push(proc_high, cur_h)
+            array.push(proc_low,  cur_l)
+            array.push(proc_idx,  cur_i)
+            array.push(proc_bar,  cur_i)
+        else
+            prev_h = array.get(proc_high, psize - 1)
+            prev_l = array.get(proc_low,  psize - 1)
+
+            // Containment check: one candle fully inside the other
+            bool contained = (cur_h <= prev_h and cur_l >= prev_l) or (cur_h >= prev_h and cur_l <= prev_l)
+
+            if contained
+                // Determine merge direction
+                merge_up = true  // default
+                if psize >= 2
+                    pp_h = array.get(proc_high, psize - 2)
+                    pp_l = array.get(proc_low,  psize - 2)
+                    // Trend direction based on previous two processed candles
+                    merge_up := prev_h > pp_h  // upward trend: merge upward
+                // Merge
+                if merge_up
+                    array.set(proc_high, psize - 1, math.max(cur_h, prev_h))
+                    array.set(proc_low,  psize - 1, math.max(cur_l, prev_l))
+                else
+                    array.set(proc_high, psize - 1, math.min(cur_h, prev_h))
+                    array.set(proc_low,  psize - 1, math.min(cur_l, prev_l))
+                // Update representative bar index to the newer one
+                array.set(proc_bar, psize - 1, cur_i)
+            else
+                array.push(proc_high, cur_h)
+                array.push(proc_low,  cur_l)
+                array.push(proc_idx,  cur_i)
+                array.push(proc_bar,  cur_i)
+
+// ============================================================
+// SECTION 3 — FRACTAL DETECTION & BI (笔) IDENTIFICATION
+//
+// A top fractal (顶分型) at position i means:
+//   proc_high[i] > proc_high[i-1] and proc_high[i] > proc_high[i+1]
+//   proc_low[i]  > proc_low[i-1]  and proc_low[i]  > proc_low[i+1]
+//
+// A bottom fractal (底分型) at position i means:
+//   proc_high[i] < proc_high[i-1] and proc_high[i] < proc_high[i+1]
+//   proc_low[i]  < proc_low[i-1]  and proc_low[i]  < proc_low[i+1]
+//
+// A valid BI (笔) requires:
+//   - Alternating top and bottom fractals
+//   - At least 5 processed candles between the two fractals
+// ============================================================
+
+// fractal_type: 1=top, -1=bottom, 0=none
+// bi_points arrays store indices into proc_* arrays
+var int[]   bi_frac_type = array.new_int(0)    // fractal type at each bi endpoint
+var int[]   bi_frac_pidx = array.new_int(0)    // proc array index
+var float[] bi_frac_price= array.new_float(0)  // price of fractal (high or low)
+var int[]   bi_frac_bar  = array.new_int(0)    // original bar_index
+
+if barstate.islast
+    array.clear(bi_frac_type)
+    array.clear(bi_frac_pidx)
+    array.clear(bi_frac_price)
+    array.clear(bi_frac_bar)
+
+    pn = array.size(proc_high)
+
+    // Step 1: find all fractals in processed K-lines
+    int[]   frac_type  = array.new_int(0)
+    int[]   frac_pidx  = array.new_int(0)
+    float[] frac_price = array.new_float(0)
+    int[]   frac_bar   = array.new_int(0)
+
+    for i = 1 to pn - 2
+        ph_prev = array.get(proc_high, i - 1)
+        ph_cur  = array.get(proc_high, i)
+        ph_next = array.get(proc_high, i + 1)
+        pl_prev = array.get(proc_low,  i - 1)
+        pl_cur  = array.get(proc_low,  i)
+        pl_next = array.get(proc_low,  i + 1)
+        bi_bar  = array.get(proc_bar,  i)
+
+        // Top fractal
+        if ph_cur > ph_prev and ph_cur > ph_next and pl_cur > pl_prev and pl_cur > pl_next
+            array.push(frac_type,  1)
+            array.push(frac_pidx,  i)
+            array.push(frac_price, ph_cur)
+            array.push(frac_bar,   bi_bar)
+        // Bottom fractal
+        else if ph_cur < ph_prev and ph_cur < ph_next and pl_cur < pl_prev and pl_cur < pl_next
+            array.push(frac_type, -1)
+            array.push(frac_pidx,  i)
+            array.push(frac_price, pl_cur)
+            array.push(frac_bar,   bi_bar)
+
+    // Step 2: select valid bi endpoints (alternating top/bottom, ≥5 processed bars apart)
+    fn = array.size(frac_type)
+    if fn > 0
+        // Start with the first fractal
+        array.push(bi_frac_type,  array.get(frac_type,  0))
+        array.push(bi_frac_pidx,  array.get(frac_pidx,  0))
+        array.push(bi_frac_price, array.get(frac_price, 0))
+        array.push(bi_frac_bar,   array.get(frac_bar,   0))
+
+        for k = 1 to fn - 1
+            cur_type  = array.get(frac_type,  k)
+            cur_pidx  = array.get(frac_pidx,  k)
+            cur_price = array.get(frac_price, k)
+            cur_bbar  = array.get(frac_bar,   k)
+
+            last_n    = array.size(bi_frac_type)
+            last_type = array.get(bi_frac_type,  last_n - 1)
+            last_pidx = array.get(bi_frac_pidx,  last_n - 1)
+
+            gap = cur_pidx - last_pidx  // processed bars between fractals
+
+            if cur_type != last_type
+                // Different fractal types
+                if gap >= 5
+                    // Valid new bi endpoint — add it
+                    array.push(bi_frac_type,  cur_type)
+                    array.push(bi_frac_pidx,  cur_pidx)
+                    array.push(bi_frac_price, cur_price)
+                    array.push(bi_frac_bar,   cur_bbar)
+                else
+                    // Gap too small — new fractal replaces last if it's a "stronger" extension
+                    last_price = array.get(bi_frac_price, last_n - 1)
+                    // For top fractal, keep the higher; for bottom, keep the lower
+                    if cur_type == 1 and cur_price > last_price
+                        array.set(bi_frac_price, last_n - 1, cur_price)
+                        array.set(bi_frac_pidx,  last_n - 1, cur_pidx)
+                        array.set(bi_frac_bar,   last_n - 1, cur_bbar)
+                    else if cur_type == -1 and cur_price < last_price
+                        array.set(bi_frac_price, last_n - 1, cur_price)
+                        array.set(bi_frac_pidx,  last_n - 1, cur_pidx)
+                        array.set(bi_frac_bar,   last_n - 1, cur_bbar)
+            else
+                // Same fractal type — keep the "extreme" one (higher top / lower bottom)
+                last_price = array.get(bi_frac_price, last_n - 1)
+                if cur_type == 1 and cur_price > last_price
+                    array.set(bi_frac_price, last_n - 1, cur_price)
+                    array.set(bi_frac_pidx,  last_n - 1, cur_pidx)
+                    array.set(bi_frac_bar,   last_n - 1, cur_bbar)
+                else if cur_type == -1 and cur_price < last_price
+                    array.set(bi_frac_price, last_n - 1, cur_price)
+                    array.set(bi_frac_pidx,  last_n - 1, cur_pidx)
+                    array.set(bi_frac_bar,   last_n - 1, cur_bbar)
+
+// ============================================================
+// SECTION 4 — MACD AREA CALCULATION PER BI (笔面积)
+//
+// For each bi (from bi_frac_bar[i] to bi_frac_bar[i+1]),
+// sum the MACD histogram values.
+// Area > 0 means net bullish histogram, < 0 net bearish.
+// ============================================================
+
+var float[] bi_macd_area = array.new_float(0)
+
+if barstate.islast
+    array.clear(bi_macd_area)
+    bn = array.size(bi_frac_bar)
+    if bn >= 2
+        // Build a bar_index → hist lookup using current bar as reference
+        // hist array for last `lookback` bars
+        int raw_n2 = math.min(lookback, bar_index + 1)
+        float[] hist_arr = array.new_float(raw_n2)
+        int[]   hidx_arr = array.new_int(raw_n2)
+        for j = 0 to raw_n2 - 1
+            offset = raw_n2 - 1 - j
+            array.set(hist_arr, j, hist[offset])
+            array.set(hidx_arr, j, bar_index - offset)
+
+        for seg = 0 to bn - 2
+            seg_start = array.get(bi_frac_bar, seg)
+            seg_end   = array.get(bi_frac_bar, seg + 1)
+            area = 0.0
+            for hj = 0 to raw_n2 - 1
+                hbar = array.get(hidx_arr, hj)
+                if hbar >= seg_start and hbar <= seg_end
+                    area += array.get(hist_arr, hj)
+            array.push(bi_macd_area, area)
+
+// ============================================================
+// SECTION 5 — ZHONGSHU (中枢) DETECTION
+//
+// A 中枢 (pivot zone) is formed by 3 consecutive bi that overlap.
+// ZG = min of the highs of the 3 bi tops
+// ZD = max of the lows of the 3 bi bottoms
+// Condition: ZG > ZD (overlapping range exists)
+// ============================================================
+
+var float[] zs_zg    = array.new_float(0)   // center zone high
+var float[] zs_zd    = array.new_float(0)   // center zone low
+var int[]   zs_start = array.new_int(0)     // bar_index start
+var int[]   zs_end   = array.new_int(0)     // bar_index end
+
+if barstate.islast
+    array.clear(zs_zg)
+    array.clear(zs_zd)
+    array.clear(zs_start)
+    array.clear(zs_end)
+
+    bn = array.size(bi_frac_bar)
+    if bn >= 4
+        // Each 中枢 spans bi points i, i+1, i+2, i+3 (3 bi segments)
+        for i = 0 to bn - 4
+            t0 = array.get(bi_frac_type,  i)
+            t1 = array.get(bi_frac_type,  i + 1)
+            t2 = array.get(bi_frac_type,  i + 2)
+            t3 = array.get(bi_frac_type,  i + 3)
+
+            p0 = array.get(bi_frac_price, i)
+            p1 = array.get(bi_frac_price, i + 1)
+            p2 = array.get(bi_frac_price, i + 2)
+            p3 = array.get(bi_frac_price, i + 3)
+
+            b0 = array.get(bi_frac_bar,   i)
+            b3 = array.get(bi_frac_bar,   i + 3)
+
+            // Determine the price range of each segment
+            // seg0: i→i+1, seg1: i+1→i+2, seg2: i+2→i+3
+            seg0_h = math.max(p0, p1)
+            seg0_l = math.min(p0, p1)
+            seg1_h = math.max(p1, p2)
+            seg1_l = math.min(p1, p2)
+            seg2_h = math.max(p2, p3)
+            seg2_l = math.min(p2, p3)
+
+            // Overlap of all three segments
+            zg = math.min(seg0_h, math.min(seg1_h, seg2_h))
+            zd = math.max(seg0_l, math.max(seg1_l, seg2_l))
+
+            if zg > zd
+                // Valid 中枢 — check if we should extend the previous one
+                nzs = array.size(zs_zg)
+                if nzs > 0
+                    prev_end = array.get(zs_end, nzs - 1)
+                    if b0 <= prev_end
+                        // Extend: update end bar and widen zone if needed
+                        prev_zg = array.get(zs_zg, nzs - 1)
+                        prev_zd = array.get(zs_zd, nzs - 1)
+                        array.set(zs_end, nzs - 1, math.max(b3, prev_end))
+                        array.set(zs_zg,  nzs - 1, math.min(prev_zg, zg))  // narrower is stricter
+                        array.set(zs_zd,  nzs - 1, math.max(prev_zd, zd))
+                    else
+                        array.push(zs_zg,    zg)
+                        array.push(zs_zd,    zd)
+                        array.push(zs_start, b0)
+                        array.push(zs_end,   b3)
+                else
+                    array.push(zs_zg,    zg)
+                    array.push(zs_zd,    zd)
+                    array.push(zs_start, b0)
+                    array.push(zs_end,   b3)
+
+// ============================================================
+// SECTION 6 — BUY / SELL SIGNAL DETECTION
+//
+// 一买/一卖 (First Buy/Sell): Trend divergence
+//   — Current bi area < previous same-direction bi area (MACD divergence)
+//   — At a new high or low
+//
+// 二买/二卖 (Second Buy/Sell): After 一买 pullback that doesn't break the low
+//
+// 三买/三卖 (Third Buy/Sell): After leaving center, pullback doesn't re-enter
+//   — Price > ZG (三买) or Price < ZD (三卖)
+// ============================================================
+
+var string signal_text  = "—"
+var float  signal_price = na
+var int    signal_bar   = na
+
+// Store latest signal info
+var string latest_signal = "—"
+var float  cur_bi_area   = na
+var float  prev_bi_area  = na
+var float  cur_zg        = na
+var float  cur_zd        = na
+var int    latest_bi_dir = 0   // 1=up, -1=down
+
+if barstate.islast
+    bn = array.size(bi_frac_bar)
+    if bn >= 2
+        // Latest bi direction
+        last_type  = array.get(bi_frac_type,  bn - 1)
+        last_price = array.get(bi_frac_price, bn - 1)
+        prev_type  = array.get(bi_frac_type,  bn - 2)
+
+        // A bi goes from bn-2 → bn-1
+        // If last_type == 1 (top fractal at end), bi went UP
+        // If last_type == -1 (bottom fractal at end), bi went DOWN
+        latest_bi_dir := last_type  // 1=up-bi ends at top, -1=down-bi ends at bottom
+
+        // Current bi area (last segment)
+        ma_n = array.size(bi_macd_area)
+        cur_bi_area  := ma_n > 0 ? array.get(bi_macd_area, ma_n - 1) : na
+        prev_bi_area := na
+
+        // Find previous same-direction bi area (skip one bi in between)
+        if ma_n >= 3
+            prev_bi_area := array.get(bi_macd_area, ma_n - 3)
+
+        // Current active 中枢
+        nzs = array.size(zs_zg)
+        if nzs > 0
+            cur_zg := array.get(zs_zg, nzs - 1)
+            cur_zd := array.get(zs_zd, nzs - 1)
+
+        // ---- Signal logic ----
+        // 一买 (First Buy): down-bi, MACD area divergence (area magnitude shrinks), at potential low
+        if latest_bi_dir == -1 and not na(cur_bi_area) and not na(prev_bi_area)
+            if math.abs(cur_bi_area) < math.abs(prev_bi_area) and cur_bi_area < 0
+                latest_signal := "一买"
+                signal_price  := last_price
+                signal_bar    := array.get(bi_frac_bar, bn - 1)
+
+        // 一卖 (First Sell): up-bi, MACD area divergence
+        if latest_bi_dir == 1 and not na(cur_bi_area) and not na(prev_bi_area)
+            if math.abs(cur_bi_area) < math.abs(prev_bi_area) and cur_bi_area > 0
+                latest_signal := "一卖"
+                signal_price  := last_price
+                signal_bar    := array.get(bi_frac_bar, bn - 1)
+
+        // 三买 (Third Buy): price above ZG after leaving center
+        if not na(cur_zg) and last_price > cur_zg and latest_bi_dir == -1
+            // A down-bi that ended above ZG → 三买 (pullback didn't enter center)
+            latest_signal := "三买"
+            signal_price  := last_price
+            signal_bar    := array.get(bi_frac_bar, bn - 1)
+
+        // 三卖 (Third Sell): price below ZD after leaving center
+        if not na(cur_zd) and last_price < cur_zd and latest_bi_dir == 1
+            latest_signal := "三卖"
+            signal_price  := last_price
+            signal_bar    := array.get(bi_frac_bar, bn - 1)
+
+        // 二买 (Second Buy): After 一买, up-bi then down-bi that doesn't break the 一买 low
+        if bn >= 4
+            pre2_type  = array.get(bi_frac_type,  bn - 3)
+            pre2_price = array.get(bi_frac_price, bn - 3)
+            // previous down-bi bottom (potential 一买 point) vs current down-bi bottom
+            if latest_bi_dir == -1 and pre2_type == -1
+                if last_price > pre2_price
+                    // Current bottom higher than previous bottom → 二买
+                    latest_signal := "二买"
+                    signal_price  := last_price
+                    signal_bar    := array.get(bi_frac_bar, bn - 1)
+
+        // 二卖 (Second Sell): After 一卖, down-bi then up-bi that doesn't break the 一卖 high
+        if bn >= 4
+            pre2_type  = array.get(bi_frac_type,  bn - 3)
+            pre2_price = array.get(bi_frac_price, bn - 3)
+            if latest_bi_dir == 1 and pre2_type == 1
+                if last_price < pre2_price
+                    latest_signal := "二卖"
+                    signal_price  := last_price
+                    signal_bar    := array.get(bi_frac_bar, bn - 1)
+
+// ============================================================
+// SECTION 7 — VISUAL OUTPUT: BI LINES
+// ============================================================
+
+// Store all bi lines in an array so MCP data_get_pine_lines can find them
+var line[] bi_lines = array.new_line(0)
+
+if barstate.islast and show_bi
+    // Delete old lines
+    for ln in bi_lines
+        line.delete(ln)
+    array.clear(bi_lines)
+
+    bn = array.size(bi_frac_bar)
+    if bn >= 2
+        for i = 0 to bn - 2
+            x1 = array.get(bi_frac_bar,   i)
+            y1 = array.get(bi_frac_price,  i)
+            x2 = array.get(bi_frac_bar,   i + 1)
+            y2 = array.get(bi_frac_price,  i + 1)
+            t1 = array.get(bi_frac_type,   i)
+
+            bi_color = t1 == -1 ? color.new(color.teal, 0) : color.new(color.orange, 0)
+            ln = line.new(x1, y1, x2, y2, xloc=xloc.bar_index,
+                          color=bi_color, width=2, style=line.style_solid)
+            array.push(bi_lines, ln)
+
+// ============================================================
+// SECTION 8 — VISUAL OUTPUT: ZHONGSHU BOXES
+// ============================================================
+
+var box[] zs_boxes = array.new_box(0)
+
+if barstate.islast and show_zs
+    for bx in zs_boxes
+        box.delete(bx)
+    array.clear(zs_boxes)
+
+    nzs = array.size(zs_zg)
+    for i = 0 to nzs - 1
+        x1  = array.get(zs_start, i)
+        x2  = array.get(zs_end,   i)
+        zg  = array.get(zs_zg,    i)
+        zd  = array.get(zs_zd,    i)
+        bx  = box.new(x1, zg, x2, zd, xloc=xloc.bar_index,
+                      border_color=color.new(color.purple, 30),
+                      bgcolor=color.new(color.purple, 80),
+                      border_width=1)
+        array.push(zs_boxes, bx)
+
+// ============================================================
+// SECTION 9 — VISUAL OUTPUT: BI FRACTAL LABELS
+// MCP data_get_pine_labels will extract these.
+// ============================================================
+
+var label[] bi_labels = array.new_label(0)
+
+if barstate.islast and show_label
+    for lb in bi_labels
+        label.delete(lb)
+    array.clear(bi_labels)
+
+    bn = array.size(bi_frac_bar)
+    for i = 0 to bn - 1
+        ft    = array.get(bi_frac_type,  i)
+        fp    = array.get(bi_frac_price, i)
+        fb    = array.get(bi_frac_bar,   i)
+        ltext = ft == 1 ? "顶" : "底"
+        lpos  = ft == 1 ? label.style_label_down : label.style_label_up
+        lcol  = ft == 1 ? color.new(color.red, 20) : color.new(color.green, 20)
+        lb    = label.new(fb, fp, ltext + "\n" + str.tostring(fp, "#.####"),
+                          xloc=xloc.bar_index, style=lpos,
+                          color=lcol, textcolor=color.white, size=size.small)
+        array.push(bi_labels, lb)
+
+// ============================================================
+// SECTION 10 — VISUAL OUTPUT: BUY/SELL SIGNAL LABELS
+// These carry the 一买/二买/三买/一卖/二卖/三卖 text that MCP
+// data_get_pine_labels specifically looks for.
+// ============================================================
+
+var label[] sig_labels = array.new_label(0)
+
+if barstate.islast and show_label and latest_signal != "—" and not na(signal_bar)
+    for lb in sig_labels
+        label.delete(lb)
+    array.clear(sig_labels)
+
+    is_buy   = str.contains(latest_signal, "买")
+    sig_col  = is_buy ? color.new(color.lime, 0) : color.new(color.red, 0)
+    sig_pos  = is_buy ? label.style_label_up : label.style_label_down
+    sig_ytxt = is_buy ? signal_price * 0.999 : signal_price * 1.001
+
+    lb = label.new(signal_bar, sig_ytxt,
+                   latest_signal + "\n" + str.tostring(signal_price, "#.####"),
+                   xloc=xloc.bar_index, style=sig_pos,
+                   color=sig_col, textcolor=color.white, size=size.normal)
+    array.push(sig_labels, lb)
+
+// ============================================================
+// SECTION 11 — MCP DATA TABLE (右下角面板)
+// This is the primary structured data output for MCP.
+// MCP tool: data_get_pine_tables
+// ============================================================
+
+var table mcp_table = table.new(position.bottom_right, 2, 10,
+                                border_color=color.new(color.gray, 30),
+                                border_width=1,
+                                frame_color=color.new(color.gray, 20),
+                                frame_width=2)
+
+// Helper to set table cell
+f_cell(tbl, col, row, txt, bg, tc) =>
+    table.cell(tbl, col, row, txt,
+               bgcolor=bg, text_color=tc,
+               text_size=size.small)
+
+if barstate.islast
+    // Header row
+    f_cell(mcp_table, 0, 0, "缠论指标", color.new(color.navy, 0), color.white)
+    f_cell(mcp_table, 1, 0, "数值",     color.new(color.navy, 0), color.white)
+
+    // Row 1: Latest Bi Direction
+    bi_dir_str = latest_bi_dir == 1 ? "↑ 向上(1)" : latest_bi_dir == -1 ? "↓ 向下(-1)" : "—"
+    bi_dir_col = latest_bi_dir == 1 ? color.new(color.teal, 60) : color.new(color.orange, 60)
+    f_cell(mcp_table, 0, 1, "最新笔方向", color.new(color.gray, 80), color.white)
+    f_cell(mcp_table, 1, 1, bi_dir_str,  bi_dir_col, color.white)
+
+    // Row 2: Current Bi MACD Area
+    area_str = not na(cur_bi_area) ? str.tostring(cur_bi_area, "#.####") : "—"
+    area_col = not na(cur_bi_area) ? (cur_bi_area >= 0 ? color.new(color.teal, 70) : color.new(color.red, 70)) : color.new(color.gray, 80)
+    f_cell(mcp_table, 0, 2, "当前笔面积", color.new(color.gray, 80), color.white)
+    f_cell(mcp_table, 1, 2, area_str,    area_col, color.white)
+
+    // Row 3: Previous Same-Direction Bi MACD Area
+    parea_str = not na(prev_bi_area) ? str.tostring(prev_bi_area, "#.####") : "—"
+    parea_col = not na(prev_bi_area) ? (prev_bi_area >= 0 ? color.new(color.teal, 70) : color.new(color.red, 70)) : color.new(color.gray, 80)
+    f_cell(mcp_table, 0, 3, "前一笔面积", color.new(color.gray, 80), color.white)
+    f_cell(mcp_table, 1, 3, parea_str,   parea_col, color.white)
+
+    // Row 4: Divergence comparison
+    div_str = "—"
+    div_col = color.new(color.gray, 80)
+    if not na(cur_bi_area) and not na(prev_bi_area)
+        if math.abs(cur_bi_area) < math.abs(prev_bi_area)
+            div_str := "✓ 面积背驰"
+            div_col := color.new(color.lime, 60)
+        else
+            div_str := "✗ 无背驰"
+            div_col := color.new(color.gray, 70)
+    f_cell(mcp_table, 0, 4, "背驰判断", color.new(color.gray, 80), color.white)
+    f_cell(mcp_table, 1, 4, div_str,   div_col, color.white)
+
+    // Row 5: ZG
+    zg_str = not na(cur_zg) ? str.tostring(cur_zg, "#.####") : "—"
+    f_cell(mcp_table, 0, 5, "中枢ZG", color.new(color.gray, 80), color.white)
+    f_cell(mcp_table, 1, 5, zg_str,  color.new(color.purple, 60), color.white)
+
+    // Row 6: ZD
+    zd_str = not na(cur_zd) ? str.tostring(cur_zd, "#.####") : "—"
+    f_cell(mcp_table, 0, 6, "中枢ZD", color.new(color.gray, 80), color.white)
+    f_cell(mcp_table, 1, 6, zd_str,  color.new(color.purple, 60), color.white)
+
+    // Row 7: Buy/Sell Signal
+    sig_col2 = str.contains(latest_signal, "买") ? color.new(color.lime, 50) : str.contains(latest_signal, "卖") ? color.new(color.red, 50) : color.new(color.gray, 80)
+    f_cell(mcp_table, 0, 7, "买卖点信号", color.new(color.gray, 80), color.white)
+    f_cell(mcp_table, 1, 7, latest_signal, sig_col2, color.white)
+
+    // Row 8: Signal Price
+    sp_str = not na(signal_price) ? str.tostring(signal_price, "#.####") : "—"
+    f_cell(mcp_table, 0, 8, "信号价格", color.new(color.gray, 80), color.white)
+    f_cell(mcp_table, 1, 8, sp_str,   color.new(color.gray, 70), color.white)
+
+    // Row 9: Bi count
+    bn_str = str.tostring(array.size(bi_frac_bar))
+    f_cell(mcp_table, 0, 9, "笔数量", color.new(color.gray, 80), color.white)
+    f_cell(mcp_table, 1, 9, bn_str,  color.new(color.gray, 70), color.white)
+
+// ============================================================
+// SECTION 12 — PLOT SERIES (for MCP data_get_pine_plots)
+// Numeric series are always available even when labels/tables
+// are rebuilt only on the last bar.
+// ============================================================
+
+// MACD histogram (already computed)
+plot(hist,        "MACD柱", color=hist >= 0 ? color.new(color.teal, 40) : color.new(color.red, 40),
+     style=plot.style_histogram, display=display.pane)
+plot(macd_line,   "MACD线",  color=color.new(color.blue, 20),   display=display.pane)
+plot(signal_line, "信号线",  color=color.new(color.orange, 20), display=display.pane)
+
+// Persistent numeric outputs for MCP to poll each bar
+// These change value only when signals are detected (last bar computation feeds into these vars)
+plot(latest_bi_dir,  "笔方向",     color=color.new(color.gray, 90), display=display.none)
+plot(cur_bi_area,    "当前笔面积", color=color.new(color.gray, 90), display=display.none)
+plot(prev_bi_area,   "前一笔面积", color=color.new(color.gray, 90), display=display.none)
+plot(cur_zg,         "中枢ZG",     color=color.new(color.gray, 90), display=display.none)
+plot(cur_zd,         "中枢ZD",     color=color.new(color.gray, 90), display=display.none)
