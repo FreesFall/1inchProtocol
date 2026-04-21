@@ -462,8 +462,7 @@ if barstate.islast and show_bi
             t1 = array.get(bi_frac_type,   i)
 
             bi_color = t1 == -1 ? color.new(color.teal, 0) : color.new(color.orange, 0)
-            ln = line.new(x1, y1, x2, y2, xloc=xloc.bar_index,
-                          color=bi_color, width=2, style=line.style_solid)
+            ln = line.new(x1, y1, x2, y2, xloc=xloc.bar_index, color=bi_color, width=2, style=line.style_solid)
             array.push(bi_lines, ln)
 
 // ============================================================
@@ -483,10 +482,7 @@ if barstate.islast and show_zs
         x2  = array.get(zs_end,   i)
         zg  = array.get(zs_zg,    i)
         zd  = array.get(zs_zd,    i)
-        bx  = box.new(x1, zg, x2, zd, xloc=xloc.bar_index,
-                      border_color=color.new(color.purple, 30),
-                      bgcolor=color.new(color.purple, 80),
-                      border_width=1)
+        bx  = box.new(x1, zg, x2, zd, xloc=xloc.bar_index, border_color=color.new(color.purple, 30), bgcolor=color.new(color.purple, 80), border_width=1)
         array.push(zs_boxes, bx)
 
 // ============================================================
@@ -509,9 +505,7 @@ if barstate.islast and show_label
         ltext = ft == 1 ? "顶" : "底"
         lpos  = ft == 1 ? label.style_label_down : label.style_label_up
         lcol  = ft == 1 ? color.new(color.red, 20) : color.new(color.green, 20)
-        lb    = label.new(fb, fp, ltext + "\n" + str.tostring(fp, "#.####"),
-                          xloc=xloc.bar_index, style=lpos,
-                          color=lcol, textcolor=color.white, size=size.small)
+        lb    = label.new(fb, fp, ltext + "\n" + str.tostring(fp, "#.####"), xloc=xloc.bar_index, style=lpos, color=lcol, textcolor=color.white, size=size.small)
         array.push(bi_labels, lb)
 
 // ============================================================
@@ -532,10 +526,7 @@ if barstate.islast and show_label and latest_signal != "—" and not na(signal_b
     sig_pos  = is_buy ? label.style_label_up : label.style_label_down
     sig_ytxt = is_buy ? signal_price * 0.999 : signal_price * 1.001
 
-    lb = label.new(signal_bar, sig_ytxt,
-                   latest_signal + "\n" + str.tostring(signal_price, "#.####"),
-                   xloc=xloc.bar_index, style=sig_pos,
-                   color=sig_col, textcolor=color.white, size=size.normal)
+    lb = label.new(signal_bar, sig_ytxt, latest_signal + "\n" + str.tostring(signal_price, "#.####"), xloc=xloc.bar_index, style=sig_pos, color=sig_col, textcolor=color.white, size=size.normal)
     array.push(sig_labels, lb)
 
 // ============================================================
@@ -544,17 +535,11 @@ if barstate.islast and show_label and latest_signal != "—" and not na(signal_b
 // MCP tool: data_get_pine_tables
 // ============================================================
 
-var table mcp_table = table.new(position.bottom_right, 2, 10,
-                                border_color=color.new(color.gray, 30),
-                                border_width=1,
-                                frame_color=color.new(color.gray, 20),
-                                frame_width=2)
+var table mcp_table = table.new(position.bottom_right, 2, 10, border_color=color.new(color.gray, 30), border_width=1, frame_color=color.new(color.gray, 20), frame_width=2)
 
 // Helper to set table cell
 f_cell(tbl, col, row, txt, bg, tc) =>
-    table.cell(tbl, col, row, txt,
-               bgcolor=bg, text_color=tc,
-               text_size=size.small)
+    table.cell(tbl, col, row, txt, bgcolor=bg, text_color=tc, text_size=size.small)
 
 if barstate.islast
     // Header row
@@ -624,8 +609,7 @@ if barstate.islast
 // ============================================================
 
 // MACD histogram (already computed)
-plot(hist,        "MACD柱", color=hist >= 0 ? color.new(color.teal, 40) : color.new(color.red, 40),
-     style=plot.style_histogram, display=display.pane)
+plot(hist, "MACD柱", color=hist >= 0 ? color.new(color.teal, 40) : color.new(color.red, 40), style=plot.style_histogram, display=display.pane)
 plot(macd_line,   "MACD线",  color=color.new(color.blue, 20),   display=display.pane)
 plot(signal_line, "信号线",  color=color.new(color.orange, 20), display=display.pane)
 
